@@ -1,0 +1,345 @@
+<?php
+
+define ("PCM_PROJECT_SERIES_PROJECT_TYPE_TID", 1);
+define ("PCM_PROJECT_SYS_ADMIN_ROLE", 'System Admin');
+define ("PCM_PROJECT_ADMIN_ROLE", 'admin');
+define ("PCM_PROJECT_PROGRAMMING_STAFF_ROLE", 'Staff - Programming');
+define ("PCM_PROJECT_MAX_ACTIVE_PROJECT_TYPE", 1);
+
+function pcm_project_menu() {
+  $items = array();
+
+  $items['node/%node/project-shows'] = array(
+      'title' => 'Shows',
+      'description' => 'Takes node object and returns shows',
+      'page callback' => 'pcm_project_shows',
+      'page arguments' => array(1),
+      'access callback' => 'pcm_project_display_show_tab',
+      'access arguments' => array(1),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => 12,
+    );
+
+  return $items;
+
+}
+
+function pcm_project_shows() {
+  $view = views_get_view('pcm_project_shows');
+  $output = $view->execute_display('page_1');
+
+  return $output;
+
+}
+
+function pcm_project_display_show_tab($node) {
+  if($node->type == 'cm_project') {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Checks if the current user has a role
+ *
+ * @param array $roles
+ *
+ * @return bool
+ */
+function pcm_project_user_has_role($roles = array()) {
+  global $user;
+
+  foreach ($roles as $role) {
+    if (in_array($role, $user->roles)) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+  * Implementation of hook_permission()
+ */
+function pcm_project_permission() {
+  $permissions = array(
+    'manage pcm_project' => array(
+      'title' => t('Manage Projects'),
+      'description' => t('Allows users to manage projects.'),
+      'restrict access' => TRUE,
+    ),
+  );
+
+  return $permissions;  
+}
+
+/**
+ * Access callback for project.
+ *
+ * @param $op
+ *   $node->op - operation
+ * @return
+ *   TRUE (access permitted) or FALSE (access denied)
+ */
+function pcm_project_access($op) {
+
+  global $user;
+
+  if (!isset($account)) {
+    $account = $user;
+  }
+   
+  switch ($op) {
+    case 'create':
+      return user_access('manage pcm_project', $account);
+  }
+}
+
+function pcm_project_node_validate($node, $form, &$form_state) {
+  
+  $roles = array(PCM_PROJECT_SYS_ADMIN_ROLE,
+		 PCM_PROJECT_ADMIN_ROLE,
+		 PCM_PROJECT_PROGRAMMING_STAFF_ROLE);
+  
+  // FIXME - user should not be able to delete a project if it has related shows
+  // FIXME - change this so that it uses permissions like the 'create' block
+  // below
+  if (($node->type == 'cm_show' || $node->type == "cm_project" ||
+       $node->type == "cm_series_request") && $node->op == 'Delete') {
+    if (!pcm_project_user_has_role($roles)) {
+      drupal_set_message("Sorry, you are not allowed to delete: ".
+			 l($node->title, "node/".$node->nid),
+			 'warning');
+      drupal_goto('dashboard');
+    }
+  }
+  
+  // if user does not have project manage permissions, they cannot have more
+  // than one active project of each type (ind and series)
+  if ($node->type == 'cm_project') {
+    $project_nid = isset($node->nid) && $node->nid ? $node->nid : NULL;
+    if ($project_nid == NULL && pcm_project_get_project_type_count($node) >=
+          PCM_PROJECT_MAX_ACTIVE_PROJECT_TYPE) {
+      if(!pcm_project_access('create')) {      
+        $error = 
+	  "Sorry, you may only have a maximum of 2 projects. One of the " .
+	  "projects may be a Series. Your changes have not been saved.";
+        form_set_error('', $error);  // don't submit the page
+      }
+    }
+  }  
+}
+
+/**
+ * Gets the count for the uid's active project type
+ *
+ * @param array $node
+ *
+ * @return int
+ */
+function pcm_project_get_project_type_count($node) {
+    $sql = "
+        SELECT count(*)
+            FROM node as n
+            INNER JOIN field_data_field_cm_project_types types
+                    ON n.nid = types.entity_id
+            INNER JOIN field_data_field_project_status status
+                    ON n.nid = status.entity_id          
+            WHERE n.uid = :uid 
+                    and types.field_cm_project_types_tid = :type
+                    and status.field_project_status_value = :status
+    ";
+ 
+    $wrapper = entity_metadata_wrapper('node', $node);
+    $args = array(
+      ':uid' => $node->uid,  // wrapper->getIdenitifier contains nid not uid
+      //':uid' => 9000,
+      ':type' => $wrapper->field_cm_project_types->tid->value(),
+      ':status' => $wrapper->field_project_status->value(),
+    );
+
+    $result = db_query($sql, $args);
+    $count = $result->fetchField();
+    //dpm('project count = ' . $count);
+    return $count;
+}
+
+function pcm_project_get_season_number_view_field($row) {
+
+  $project = node_load($row->nid);
+
+  if ($project->field_cm_project_types[LANGUAGE_NONE][0]['tid'] 
+      != PCM_PROJECT_SERIES_PROJECT_TYPE_TID) {
+    return 'N/A';
+  }
+  return pcm_project_get_season_number($row->nid);
+}
+
+function pcm_project_get_season_number($project_nid, 
+				       $series_request_nid = NULL) {
+  $sql = "
+    SELECT count(1) FROM 
+      (SELECT p.nid as pnid 
+       FROM og_membership og 
+       INNER JOIN node n ON n.nid=og.etid 
+       INNER JOIN node p ON p.nid=gid 
+       INNER JOIN field_data_field_quarter q ON q.entity_id=n.nid 
+       INNER JOIN node qn ON qn.nid=field_quarter_target_id 
+       WHERE og.entity_type='node' 
+       AND n.type='project_renewal_season_' 
+       GROUP BY p.nid, qn.nid) AS sub 
+     WHERE sub.pnid=:pnid
+   ";
+
+  $result = db_query($sql, array(':pnid'=>$project_nid))->fetchField();
+ 
+  $sql = "
+    SELECT count(1) FROM 
+      (SELECT field_request_project_target_id as pnid
+       FROM field_data_field_request_project rp
+       INNER JOIN field_data_field_season_request_dates d USING(entity_id) ";
+
+  if ($series_request_nid) {
+    $sql .= " WHERE d.entity_id != :srnid "; 
+  }
+  
+  $sql .= "
+       GROUP BY pnid, d.field_season_request_dates_value) AS sub 
+     WHERE sub.pnid=:pnid
+   ";
+
+  $args = array();
+  $args[':pnid'] = $project_nid;
+  if ($series_request_nid) {
+    $args[':srnid'] = $series_request_nid;
+  }
+
+  $result2 = db_query($sql, $args)->fetchField();
+
+  return $result + $result2;
+}
+
+function pcm_project_get_approved_series_requests($project_nid) {
+  $sql = "
+     SELECT count(1)   
+     FROM og_membership og 
+     INNER JOIN node n ON n.nid=og.etid 
+     INNER JOIN node p ON p.nid=gid 
+     INNER JOIN field_data_field_quarter q ON q.entity_id=n.nid 
+     WHERE og.entity_type='node' 
+     AND n.type='project_renewal_season_' 
+     AND p.nid=:pnid
+   ";
+
+  $result = db_query($sql, array(':pnid'=>$project_nid))->fetchField();
+ 
+  $sql = "
+    SELECT count(1) 
+    FROM field_data_field_request_project rp
+    INNER JOIN field_data_field_series_request_status rs 
+      ON rs.entity_id=rp.entity_id
+    WHERE rp.field_request_project_target_id =:pnid
+    AND (rs.field_series_request_status_value = 'Approved' OR 
+         rs.field_series_request_status_value = 'Scheduled')
+   ";
+
+  $args = array(
+		':pnid'=>$project_nid,
+		);
+
+  $result2 = db_query($sql, $args)->fetchField();
+
+  return $result + $result2;
+}
+
+/**
+ * Implements hook_node_presave()
+ */
+function pcm_project_node_presave($node) {
+  if ($node->type == 'cm_project') {
+      $project_status = 
+          pcm_project_get_single_field_value ($node,
+            'field_project_status');
+      if ($project_status != NULL && $project_status == 'Active') {
+        $node->group_group[LANGUAGE_NONE][0]['value'] = 1;
+      }
+      else {
+        $node->group_group[LANGUAGE_NONE][0]['value'] = 0;
+      }
+  }
+}
+
+/**
+ * Gets the field value of a given field
+ *
+ * @param array $node, string $field_name, string $index
+ *
+ * @return field value
+ */
+function pcm_project_get_single_field_value($node, $field_name, 
+						  $index = 'value') {
+  if (isset($node->{$field_name})) {
+    $field = $node->{$field_name};
+    if (isset($field[LANGUAGE_NONE]) && isset($field[LANGUAGE_NONE][0])) {
+      return $field[LANGUAGE_NONE][0][$index];
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Called from view: projects_active_completion_date_past
+ * 
+ * Determine if group has shows, if so, remove rows from view
+ *
+ * @param nid (from cm_project view)
+ *
+ * @return TRUE/FALSE
+ */
+function pcm_project_view_projects_date_past_remove_row($group_id = NULL) {
+//dsm($group_id);
+  
+  $sql = "
+   SELECT gid
+   FROM og_membership og
+   WHERE og.entity_type='node'
+   AND og.gid=:ogid
+  ";
+  
+  $args = array(
+    ':ogid'=>$group_id,     // og_membership.gid
+  );
+  
+  $result = db_query($sql, $args);
+  //dsm($result->rowCount());
+  
+  // If the code returns TRUE the current row is removed from the results.
+  if($result->rowCount()==0) {
+    return FALSE;
+  }
+  else {
+    return TRUE;
+  }
+}
+
+function pcm_project_user_dashboard_add_show_link($row) {
+  $project = node_load($row->nid);
+  $wrapper = entity_metadata_wrapper('node', $project);
+
+  if ($wrapper->field_cm_project_types->label() == 'Series') {
+    if (!user_access('view airing grid')) {
+      $text = t("NA");
+      return $text;
+    }
+    else {
+      $text = t("Add Special");
+    }
+  }
+  else {
+    $text = t("Add Individual");
+  }
+  return l($text, "node/add/cm-show", 
+	   array('query'=>array('og_group_ref' => $row->nid,
+				'is_special'=>'yes',
+				'destination'=>'dashboard')));
+
+}
